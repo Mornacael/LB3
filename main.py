@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.params import Security
+from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, Boolean
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
@@ -69,6 +70,11 @@ class Admin(Base):
     username = Column(String, unique=True, index=True)
     hashed_password = Column(String)
 
+# Створюємо власну модель для запиту
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -84,6 +90,7 @@ def get_db():
         db.close()
 
 
+# Оновлені функції доступу
 def get_current_client(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -96,13 +103,24 @@ def get_current_client(token: str = Depends(oauth2_scheme), db: Session = Depend
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-@app.post("/clients/")
-def create_client(username: str, hashed_password: str,  db: Session = Depends(get_db)):
-    client = Client(username = username, hashed_password = hashed_password)
-    db.add(client)
-    db.commit()
-    db.refresh(client)
-    return client
+def get_current_admin(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        admin = db.query(Admin).filter(Admin.username == username).first()
+        if admin is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return admin
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+#@app.post("/clients/")
+#def create_client(username: str, hashed_password: str,  db: Session = Depends(get_db)):
+#    client = Client(username = username, hashed_password = hashed_password)
+#    db.add(client)
+#    db.commit()
+#    db.refresh(client)
+#    return client
 
 
 # Ендпоінти рахунків
@@ -111,6 +129,7 @@ def create_account(client: Client = Depends(get_current_client), db: Session = D
     account = Account(owner_id=client.id)
     db.add(account)
     db.commit()
+    db.refresh(account)
     return {"message": "Account created"}
 
 @app.put("/accounts/{account_id}/block")
@@ -122,12 +141,12 @@ def block_account(account_id: int, client: Client = Depends(get_current_client),
     db.commit()
     return {"message": "Account blocked"}
 
-
-
-
 @app.post("/credit-cards/")
 def create_credit_card(account_id: int, card_number: str, expiration_date: str, cvv: str,
-                       db: Session = Depends(get_db)):
+                       client: Client = Depends(get_current_client), db: Session = Depends(get_db)):
+    account = db.query(Account).filter(Account.id == account_id, Account.owner_id == client.id).first()
+    if not account:
+        raise HTTPException(status_code=403, detail="Access denied")
     card = CreditCard(account_id=account_id, card_number=card_number, expiration_date=expiration_date, cvv=cvv)
     db.add(card)
     db.commit()
@@ -136,8 +155,8 @@ def create_credit_card(account_id: int, card_number: str, expiration_date: str, 
 
 
 @app.post("/payments/")
-def make_payment(account_id: int, amount: float, db: Session = Depends(get_db)):
-    account = db.query(Account).filter(Account.id == account_id).first()
+def make_payment(account_id: int, amount: float, client: Client = Depends(get_current_client), db: Session = Depends(get_db)):
+    account = db.query(Account).filter(Account.id == account_id, Account.owner_id == client.id).first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
     if account.blocked:
@@ -153,26 +172,14 @@ def make_payment(account_id: int, amount: float, db: Session = Depends(get_db)):
     return payment
 
 
-@app.put("/accounts/{account_id}/unblock")
-def unblock_account(account_id: int, admin_id: int, db: Session = Depends(get_db)):
-    admin = db.query(Admin).filter(Admin.id == admin_id).first()
-    if not admin:
-        raise HTTPException(status_code=403, detail="Unauthorized action")
-    account = db.query(Account).filter(Account.id == account_id).first()
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
-    account.is_blocked = False
-    db.commit()
-    return {"message": "Account unblocked"}
-
-
 @app.put("/accounts/{account_id}/deposit")
-def deposit(account_id: int, amount: float, db: Session = Depends(get_db)):
-    account = db.query(Account).filter(Account.id == account_id).first()
+def deposit(account_id: int, amount: float, client: Client = Depends(get_current_client), db: Session = Depends(get_db)):
+    account = db.query(Account).filter(Account.id == account_id, Account.owner_id == client.id).first()
     if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
+        raise HTTPException(status_code=403, detail="Access denied")
     account.balance += amount
     db.commit()
+    db.refresh(account)
     return {"message": "Account credited", "new_balance": account.balance}
 
 @app.get("/clients/")
@@ -180,12 +187,14 @@ def get_clients(db: Session = Depends(get_db)):
     return db.query(Client).all()
 
 @app.get("/accounts/")
-def get_accounts(db: Session = Depends(get_db)):
+def get_accounts(admin: Admin = Depends(get_current_admin), db: Session = Depends(get_db)):
     return db.query(Account).all()
 
 @app.get("/credit-cards/")
-def get_credit_cards(db: Session = Depends(get_db)):
-    return db.query(CreditCard).all()
+def get_credit_cards(client: Client = Depends(get_current_client), db: Session = Depends(get_db)):
+    if isinstance(client, Admin):  # Перевірка, чи це адмін
+        return db.query(CreditCard).all()
+    return db.query(CreditCard).filter(CreditCard.account.has(owner_id=client.id)).all()
 
 @app.get("/payments/")
 def get_payments(db: Session = Depends(get_db)):
@@ -205,21 +214,12 @@ def create_access_token(data: dict, expires_delta: timedelta):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-
-def get_current_admin(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        admin = db.query(Admin).filter(Admin.username == username).first()
-        if admin is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return admin
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
 # Ендпоінт для реєстрації адміністратора
 @app.post("/admin/register")
 def register_admin(username: str, password: str, db: Session = Depends(get_db)):
+    existing_admin = db.query(Admin).filter_by(username=username).first()
+    if existing_admin:
+        return {"error": "Користувач з таким ім'ям вже існує"}
     hashed_password = get_password_hash(password)
     admin = Admin(username=username, hashed_password=hashed_password)
     db.add(admin)
@@ -230,12 +230,12 @@ def register_admin(username: str, password: str, db: Session = Depends(get_db)):
 
 # Ендпоінт для отримання токена адміністратора
 @app.post("/admin/token")
-def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login_for_access_token(form_data: LoginRequest = Depends(), db: Session = Depends(get_db)):
     admin = db.query(Admin).filter(Admin.username == form_data.username).first()
-    if not admin or not verify_password(form_data.password, admin.password):
+    if not admin or not verify_password(form_data.password, admin.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
-    access_token = create_access_token(data={"sub": admin.username})
+    access_token = create_access_token(data={"sub": admin.username}, expires_delta=timedelta(minutes=30))
     return {"access_token": access_token, "token_type": "bearer"}
 
 security = HTTPBearer()
@@ -250,12 +250,12 @@ def register_client(username: str, password: str, db: Session = Depends(get_db))
     return {"message": "Client registered"}
 
 @app.post("/token")
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(form_data: LoginRequest = Depends(), db: Session = Depends(get_db)):
     user = db.query(Client).filter(Client.username == form_data.username).first() or \
            db.query(Admin).filter(Admin.username == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.hashed_password):
+    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
-    access_token = create_access_token({"sub": user.username}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    access_token = jwt.encode({"sub": user.username, "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)}, SECRET_KEY, algorithm=ALGORITHM)
     return {"access_token": access_token, "token_type": "bearer"}
 
 
